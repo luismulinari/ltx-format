@@ -1,0 +1,63 @@
+{
+	"name": "ltx-format",
+	"version": "0.1.0",
+	"description": "Reader and writer for the LTX (Lite Transaction) file format v3, byte-compatible with Litestream v0.5.",
+	"keywords": [
+		"ltx",
+		"litestream",
+		"sqlite",
+		"replication",
+		"wal",
+		"backup",
+		"lz4",
+		"crc64"
+	],
+	"license": "Apache-2.0",
+	"author": "Luis Henrique Mulinari",
+	"homepage": "https://github.com/luismulinari/ltx-format#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/luismulinari/ltx-format.git"
+	},
+	"bugs": {
+		"url": "https://github.com/luismulinari/ltx-format/issues"
+	},
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist"
+	],
+	"sideEffects": false,
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"build": "tsdown",
+		"prepack": "npm run build",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"test:coverage": "vitest run --coverage",
+		"lint": "biome check",
+		"format": "biome check --write",
+		"check:package": "publint --strict && attw --pack . --ignore-rules cjs-resolves-to-esm",
+		"verify": "npm run lint && npm run typecheck && npm run test && npm run build && npm run check:package"
+	},
+	"devDependencies": {
+		"@arethetypeswrong/cli": "^0.18.5",
+		"@biomejs/biome": "^2.5.7",
+		"@types/node": "^22.15.0",
+		"@vitest/coverage-v8": "^4.1.10",
+		"publint": "^0.3.23",
+		"tsdown": "^0.22.14",
+		"typescript": "^5.9.0",
+		"vitest": "^4.1.10"
+	}
+}
