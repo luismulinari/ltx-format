@@ -74,9 +74,9 @@ export function encodeLtx(options: EncodeLtxOptions): Uint8Array {
 	// Pages must appear in ascending order: the index requires it, and keeping
 	// the block in the same order makes block and index offsets agree.
 	const pages = [...options.pages].sort((a, b) => a.pgno - b.pgno);
-	assertPagesAreValid(pages, pageSize, commit);
-
 	const isSnapshotFile = minTXID === 1n;
+	assertPagesAreValid(pages, pageSize, commit, isSnapshotFile);
+
 	const header: LtxHeader = {
 		flags: trackChecksums ? 0 : HEADER_FLAG_NO_CHECKSUM,
 		pageSize,
@@ -98,6 +98,12 @@ export function encodeLtx(options: EncodeLtxOptions): Uint8Array {
 		throw new Error(
 			'encodeLtx: incremental files require a non-zero preApplyChecksum ' +
 				'when checksum tracking is enabled'
+		);
+	}
+	if (!trackChecksums && header.preApplyChecksum !== 0n) {
+		throw new Error(
+			'encodeLtx: preApplyChecksum is not allowed unless trackChecksums ' +
+				'is enabled — the reference implementation rejects such files'
 		);
 	}
 	const headerBytes = writeHeader(header);
@@ -146,8 +152,12 @@ export function encodeLtx(options: EncodeLtxOptions): Uint8Array {
 function assertPagesAreValid(
 	pages: LtxPage[],
 	pageSize: number,
-	commit: number
+	commit: number,
+	isSnapshotFile: boolean
 ) {
+	if (commit < 1) {
+		throw new Error('LTX commit must be at least one page');
+	}
 	const lock = lockPgno(pageSize);
 	let previous = 0;
 	for (const page of pages) {
@@ -162,16 +172,44 @@ function assertPagesAreValid(
 				`LTX must not carry the lock page (${lock}) for page size ${pageSize}`
 			);
 		}
+		if (page.pgno > commit) {
+			throw new Error(
+				`LTX page ${page.pgno} is past the commit size of ${commit} pages`
+			);
+		}
 		if (page.data.length !== pageSize) {
 			throw new Error(
 				`LTX page ${page.pgno} is ${page.data.length} bytes, expected ${pageSize}`
 			);
 		}
+		if (isSnapshotFile) {
+			// A snapshot has to carry the whole database, so the page numbers
+			// run 1..commit with only the lock page missing. A gap here writes
+			// a file `litestream restore` rejects outright.
+			const expected = nextSnapshotPgno(previous, lock);
+			if (page.pgno !== expected) {
+				throw new Error(
+					`LTX snapshot must carry every page: expected page ${expected}, got ${page.pgno}`
+				);
+			}
+		}
 		previous = page.pgno;
 	}
-	if (commit < 1) {
-		throw new Error('LTX commit must be at least one page');
+	if (isSnapshotFile) {
+		const last = commit === lock ? commit - 1 : commit;
+		if (previous !== last) {
+			throw new Error(
+				`LTX snapshot must carry every page: expected page ${last} last, got ${previous || 'none'}`
+			);
+		}
 	}
+}
+
+/** The page number that must follow `previous` in a snapshot. */
+function nextSnapshotPgno(previous: number, lock: number): number {
+	if (previous === 0) return 1;
+	// The lock page is never carried, so it is stepped over rather than emitted.
+	return previous + 1 === lock ? previous + 2 : previous + 1;
 }
 
 /** Encodes the page index region, including its trailing u64 length field. */

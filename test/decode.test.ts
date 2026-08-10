@@ -46,11 +46,27 @@ describe('decodeLtx against litestream goldens', () => {
 		expect(() => decodeLtx(fixture(INCREMENTAL))).not.toThrow();
 	});
 
-	it('rejects a corrupted file', () => {
+	it('rejects a corrupted page payload', () => {
 		const corrupted = fixture(SNAPSHOT);
-		// Flip a byte inside the first page's compressed payload.
+		// Flip a byte inside the first page's compressed payload. This is
+		// caught while decompressing, before any checksum is looked at.
 		corrupted[200] ^= 0xff;
-		expect(() => decodeLtx(corrupted)).toThrow();
+		expect(() => decodeLtx(corrupted)).toThrow(/Truncated LZ4 block/);
+	});
+
+	it('rejects tampering that only the file checksum can catch', () => {
+		// Bytes 80..99 of the header are reserved and read by nothing, so a
+		// flip here survives header validation, the page walk, and the index
+		// cross-check. If this test fails, the file checksum gate is gone.
+		const tampered = fixture(SNAPSHOT);
+		tampered[90] ^= 0xff;
+		expect(() => decodeLtx(tampered)).toThrow(/file checksum mismatch/);
+	});
+
+	it('rejects a tampered post-apply checksum', () => {
+		const tampered = fixture(SNAPSHOT);
+		tampered[tampered.length - 16] ^= 0xff;
+		expect(() => decodeLtx(tampered)).toThrow(/file checksum mismatch/);
 	});
 
 	it('skips checksum verification when asked', () => {
@@ -68,6 +84,24 @@ describe('decodeLtx against litestream goldens', () => {
 
 		expect(image.length).toBe(expected.length);
 		expect(Buffer.from(image).equals(Buffer.from(expected))).toBe(true);
+	});
+
+	it('applies a change to the highest page in the file', () => {
+		// The goldens happen to leave page 4 byte-identical across the two
+		// transactions, so an off-by-one that drops the last page still
+		// produces the right image there. This does not let that slide.
+		const snapshot = decodeLtx(fixture(SNAPSHOT));
+		const image = decodeToSnapshotImage(snapshot);
+		const { pageSize, commit } = snapshot.header;
+
+		const replaced = new Uint8Array(pageSize).fill(0x5a);
+		const updated = applyLtxToImage(image, {
+			...snapshot,
+			pages: [{ pgno: commit, data: replaced }],
+		});
+
+		const last = updated.subarray((commit - 1) * pageSize);
+		expect(last.every((b) => b === 0x5a)).toBe(true);
 	});
 
 	it('applies an incremental on top of a snapshot', () => {

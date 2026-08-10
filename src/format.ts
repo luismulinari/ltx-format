@@ -20,6 +20,8 @@
  * ```
  */
 
+import { CHECKSUM_FLAG } from './crc64.js';
+
 export const MAGIC = 0x4c545831; // "LTX1"
 export const VERSION = 3;
 export const HEADER_SIZE = 100;
@@ -156,6 +158,13 @@ export function writeHeader(header: LtxHeader): Uint8Array {
 	return bytes;
 }
 
+/**
+ * Enforces every invariant `Header.Validate()` enforces in ltx v0.5.1.
+ *
+ * Kept deliberately in step with the reference: a header this accepts but the
+ * reference rejects is a file we can write and `litestream restore` cannot
+ * read, which is the failure mode this library exists to avoid.
+ */
 function validateHeader(header: LtxHeader) {
 	if (!isValidPageSize(header.pageSize)) {
 		throw new Error(`Invalid LTX page size: ${header.pageSize}`);
@@ -169,22 +178,52 @@ function validateHeader(header: LtxHeader) {
 	if (header.minTXID === 0n) {
 		throw new Error('LTX minTXID must be non-zero');
 	}
-	if (isSnapshot(header) && header.preApplyChecksum !== 0n) {
-		throw new Error('LTX snapshot must have a zero pre-apply checksum');
+
+	// WAL provenance is all-or-nothing: a salt or a size without an offset
+	// describes a WAL position that cannot exist.
+	if (header.walOffset < 0n) {
+		throw new Error('LTX WAL offset cannot be negative');
 	}
+	if (header.walSize < 0n) {
+		throw new Error('LTX WAL size cannot be negative');
+	}
+	if (
+		(header.walSalt1 !== 0 || header.walSalt2 !== 0) &&
+		header.walOffset === 0n
+	) {
+		throw new Error('LTX WAL salt requires a WAL offset');
+	}
+	if (header.walOffset === 0n && header.walSize !== 0n) {
+		throw new Error('LTX WAL size requires a WAL offset');
+	}
+
 	/*
 	 * The pre-apply checksum only carries meaning when checksums are tracked.
 	 * Litestream v0.5.11 sets HeaderFlagNoChecksum and writes zero here even on
 	 * incrementals, so requiring a value unconditionally would reject files the
-	 * reference implementation produces.
+	 * reference implementation produces — and, symmetrically, a non-zero value
+	 * alongside that flag is a file the reference implementation rejects.
 	 */
 	const tracksChecksums = (header.flags & HEADER_FLAG_NO_CHECKSUM) === 0;
-	if (
-		tracksChecksums &&
-		!isSnapshot(header) &&
-		header.preApplyChecksum === 0n
-	) {
-		throw new Error('LTX non-snapshot requires a pre-apply checksum');
+	if (isSnapshot(header)) {
+		if (header.preApplyChecksum !== 0n) {
+			throw new Error('LTX snapshot must have a zero pre-apply checksum');
+		}
+	} else if (!tracksChecksums) {
+		if (header.preApplyChecksum !== 0n) {
+			throw new Error(
+				'LTX pre-apply checksum is not allowed when checksum tracking is off'
+			);
+		}
+	} else {
+		if (header.preApplyChecksum === 0n) {
+			throw new Error('LTX non-snapshot requires a pre-apply checksum');
+		}
+		if ((header.preApplyChecksum & CHECKSUM_FLAG) === 0n) {
+			throw new Error(
+				'LTX pre-apply checksum is missing its high flag bit'
+			);
+		}
 	}
 }
 

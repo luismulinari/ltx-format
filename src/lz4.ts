@@ -84,10 +84,19 @@ export function decodeLz4Frame(
 		source.byteOffset,
 		source.byteLength
 	);
-	if (view.getUint32(offset, true) !== MAGIC) {
+	let cursor = offset;
+	/** Guards every read, since `source` is untrusted input. */
+	function needBytes(bytes: number, what: string) {
+		if (cursor + bytes > source.length) {
+			throw new Error(`Truncated LZ4 frame: ${what}`);
+		}
+	}
+
+	needBytes(7, 'no room for a frame descriptor');
+	if (view.getUint32(cursor, true) !== MAGIC) {
 		throw new Error(`Not an LZ4 frame at offset ${offset}`);
 	}
-	let cursor = offset + 4;
+	cursor += 4;
 
 	const flg = source[cursor++];
 	const bd = source[cursor++];
@@ -98,6 +107,7 @@ export function decodeLz4Frame(
 	if (flg & FLG_DICT_ID) cursor += 4;
 	// Header checksum byte.
 	cursor++;
+	needBytes(0, 'frame descriptor runs past its end');
 
 	const hasBlockChecksum = Boolean(flg & FLG_BLOCK_CHECKSUM);
 	const hasContentChecksum = Boolean(flg & FLG_CONTENT_CHECKSUM);
@@ -106,12 +116,22 @@ export function decodeLz4Frame(
 	const chunks: Uint8Array[] = [];
 	let total = 0;
 	for (;;) {
+		needBytes(4, 'no room for a block header');
 		const blockHeader = view.getUint32(cursor, true);
 		cursor += 4;
 		if (blockHeader === 0) break;
 
 		const isUncompressed = (blockHeader & UNCOMPRESSED_BLOCK_FLAG) !== 0;
 		const blockSize = blockHeader & 0x7fffffff;
+		if (blockSize > blockMaxSize) {
+			throw new Error(
+				`LZ4 block of ${blockSize} bytes exceeds the frame's ${blockMaxSize}-byte maximum`
+			);
+		}
+		needBytes(
+			blockSize + (hasBlockChecksum ? 4 : 0),
+			'block runs past its end'
+		);
 		const block = source.subarray(cursor, cursor + blockSize);
 		cursor += blockSize;
 		if (hasBlockChecksum) cursor += 4;
@@ -122,7 +142,10 @@ export function decodeLz4Frame(
 		chunks.push(chunk);
 		total += chunk.length;
 	}
-	if (hasContentChecksum) cursor += 4;
+	if (hasContentChecksum) {
+		needBytes(4, 'no room for the content checksum');
+		cursor += 4;
+	}
 
 	const data = new Uint8Array(total);
 	let written = 0;
@@ -154,47 +177,74 @@ function blockMaxSizeFor(bd: number): number {
  * The block format is a series of sequences: a token byte splitting into a
  * literal length and a match length, optional length-extension bytes, the
  * literals themselves, and a two-byte little-endian back-reference offset.
- * Matches may overlap their own output, so the copy is byte-at-a-time.
+ * Matches may overlap their own output, so that copy is byte-at-a-time.
+ *
+ * Every length in a block is attacker-controlled, so each one is checked
+ * against both the remaining input and the output capacity before it is used.
+ * Writing past a `Uint8Array` is silently discarded rather than throwing, so
+ * without these checks a truncated block would decode to plausible-looking
+ * garbage instead of an error.
  */
 function decompressLz4Block(block: Uint8Array, maxSize: number): Uint8Array {
 	const out = new Uint8Array(maxSize);
 	let input = 0;
 	let output = 0;
 
+	/** Reads a length extension: a run of 255s ended by any other byte. */
+	function readLengthExtension(base: number): number {
+		let length = base;
+		for (;;) {
+			if (input >= block.length) {
+				throw new Error('Truncated LZ4 block: unterminated length');
+			}
+			const extension = block[input++];
+			length += extension;
+			if (extension !== 255) return length;
+		}
+	}
+
 	while (input < block.length) {
 		const token = block[input++];
 
 		let literalLength = token >> 4;
 		if (literalLength === 15) {
-			let extension = 0;
-			do {
-				extension = block[input++];
-				literalLength += extension;
-			} while (extension === 255);
+			literalLength = readLengthExtension(literalLength);
 		}
-
-		for (let i = 0; i < literalLength; i++) {
-			out[output++] = block[input++];
+		if (input + literalLength > block.length) {
+			throw new Error('Truncated LZ4 block: literals run past its end');
 		}
+		if (output + literalLength > out.length) {
+			throw new Error('LZ4 block decompresses past its maximum size');
+		}
+		out.set(block.subarray(input, input + literalLength), output);
+		input += literalLength;
+		output += literalLength;
 
 		// The final sequence ends after its literals, with no match.
 		if (input >= block.length) break;
 
+		if (input + 2 > block.length) {
+			throw new Error(
+				'Truncated LZ4 block: match offset runs past its end'
+			);
+		}
 		const matchOffset = block[input] | (block[input + 1] << 8);
 		input += 2;
 		if (matchOffset === 0) {
 			throw new Error('Invalid LZ4 match offset 0');
 		}
+		if (matchOffset > output) {
+			throw new Error('LZ4 match offset points before the block');
+		}
 
 		let matchLength = token & 0x0f;
 		if (matchLength === 15) {
-			let extension = 0;
-			do {
-				extension = block[input++];
-				matchLength += extension;
-			} while (extension === 255);
+			matchLength = readLengthExtension(matchLength);
 		}
 		matchLength += 4;
+		if (output + matchLength > out.length) {
+			throw new Error('LZ4 block decompresses past its maximum size');
+		}
 
 		let matchPosition = output - matchOffset;
 		for (let i = 0; i < matchLength; i++) {

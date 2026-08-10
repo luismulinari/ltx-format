@@ -18,6 +18,7 @@ import type { LtxHeader } from '../src/format.js';
 import {
 	formatFilename,
 	formatTxid,
+	HEADER_FLAG_NO_CHECKSUM,
 	isValidPageSize,
 	lockPgno,
 	parseTxid,
@@ -81,6 +82,21 @@ describe('uvarint', () => {
 			/Truncated/
 		);
 	});
+
+	it('rejects an encoding that decodes past the safe integer range', () => {
+		// Zero-payload continuation bytes leave the running value at 0 while
+		// the shift grows, so the overflow only lands on the final byte.
+		const overflowing = new Uint8Array([
+			0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f,
+		]);
+		expect(() => readUvarint(overflowing, 0)).toThrow(/safe integer/);
+	});
+
+	it('rejects an encoding longer than a 64-bit value can be', () => {
+		expect(() => readUvarint(new Uint8Array(20).fill(0x80), 0)).toThrow(
+			/longer than 10 bytes/
+		);
+	});
 });
 
 describe('crc64', () => {
@@ -130,6 +146,37 @@ describe('crc64', () => {
 		expect(foldPageChecksum(forward, 2, p2)).toBe(
 			foldPageChecksum(CHECKSUM_FLAG, 1, p1)
 		);
+	});
+
+	it('incremental folding matches a full recompute', () => {
+		// This is the recipe the README gives for maintaining a post-apply
+		// checksum across incrementals. If it drifts from a from-scratch
+		// computation over the whole database, the advice is wrong.
+		const pageSize = 512;
+		const page = (fill: number) => new Uint8Array(pageSize).fill(fill);
+		const before = [page(1), page(2), page(3)];
+
+		const recompute = (image: Uint8Array[]) =>
+			image.reduce(
+				(acc, data, i) => foldPageChecksum(acc, i + 1, data),
+				CHECKSUM_FLAG
+			);
+
+		// Change page 2, append page 4.
+		const dirty = [
+			{ pgno: 2, data: page(0x22) },
+			{ pgno: 4, data: page(0x44) },
+		];
+		const after = [before[0], dirty[0].data, before[2], dirty[1].data];
+
+		let rolling = recompute(before);
+		for (const p of dirty) {
+			const old = before[p.pgno - 1];
+			if (old) rolling = foldPageChecksum(rolling, p.pgno, old);
+			rolling = foldPageChecksum(rolling, p.pgno, p.data);
+		}
+
+		expect(rolling).toBe(recompute(after));
 	});
 });
 
@@ -248,6 +295,25 @@ describe('format helpers', () => {
 			nodeID: 0n,
 		};
 		expect(() => writeHeader(base)).toThrow(/greater than maxTXID/);
+		// A non-snapshot with checksum tracking off must carry no pre-apply
+		// checksum at all — ltx v0.5.1 rejects the file otherwise.
+		expect(() =>
+			writeHeader({
+				...base,
+				minTXID: 2n,
+				maxTXID: 2n,
+				flags: HEADER_FLAG_NO_CHECKSUM,
+			})
+		).toThrow(/not allowed/);
+		// A tracked non-snapshot needs the flag bit set on its checksum.
+		expect(() =>
+			writeHeader({
+				...base,
+				minTXID: 2n,
+				maxTXID: 2n,
+				preApplyChecksum: 7n,
+			})
+		).toThrow(/high flag bit/);
 		expect(() =>
 			writeHeader({ ...base, minTXID: 0n, maxTXID: 0n })
 		).toThrow(/non-zero/);
@@ -255,5 +321,44 @@ describe('format helpers', () => {
 			writeHeader({ ...base, minTXID: 1n, maxTXID: 1n })
 		).toThrow(/zero pre-apply checksum/);
 		expect(() => writeHeader({ ...base, flags: 0xff })).toThrow(/flags/);
+	});
+
+	it('rejects incoherent WAL provenance', () => {
+		const base: LtxHeader = {
+			flags: 0,
+			pageSize: 4096,
+			commit: 1,
+			minTXID: 1n,
+			maxTXID: 1n,
+			timestamp: 0n,
+			preApplyChecksum: 0n,
+			walOffset: 0n,
+			walSize: 0n,
+			walSalt1: 0,
+			walSalt2: 0,
+			nodeID: 0n,
+		};
+		expect(() => writeHeader({ ...base, walOffset: -1n })).toThrow(
+			/offset cannot be negative/
+		);
+		expect(() =>
+			writeHeader({ ...base, walOffset: 32n, walSize: -1n })
+		).toThrow(/size cannot be negative/);
+		expect(() => writeHeader({ ...base, walSalt1: 1 })).toThrow(
+			/salt requires a WAL offset/
+		);
+		expect(() => writeHeader({ ...base, walSize: 4096n })).toThrow(
+			/size requires a WAL offset/
+		);
+		// The coherent case still writes.
+		expect(() =>
+			writeHeader({
+				...base,
+				walOffset: 32n,
+				walSize: 4096n,
+				walSalt1: 1,
+				walSalt2: 2,
+			})
+		).not.toThrow();
 	});
 });

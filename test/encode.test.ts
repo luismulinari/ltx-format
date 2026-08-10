@@ -109,7 +109,9 @@ describe('encodeLtx', () => {
 		}
 	);
 
-	it('round-trips randomised page sets', () => {
+	// Sparse page sets are encoded as incrementals: a snapshot has to carry
+	// every page, which the encoder now enforces.
+	it('round-trips randomised sparse incrementals', () => {
 		// Deterministic PRNG so a failure is reproducible.
 		let seed = 0x2545f491;
 		const random = () => {
@@ -139,8 +141,8 @@ describe('encodeLtx', () => {
 				encodeLtx({
 					pageSize,
 					commit,
-					minTXID: 1n,
-					maxTXID: 1n,
+					minTXID: 2n,
+					maxTXID: 2n,
 					pages,
 				})
 			);
@@ -226,5 +228,104 @@ describe('encodeLtx', () => {
 				preApplyChecksum: 1n << 63n,
 			})
 		).toThrow(/postApplyChecksum/);
+	});
+
+	it('rejects a pre-apply checksum when tracking is off', () => {
+		// ltx v0.5.1's Header.Validate() rejects this file, so writing one
+		// would produce something litestream cannot read.
+		expect(() =>
+			encodeLtx({
+				pageSize: 512,
+				commit: 1,
+				minTXID: 2n,
+				maxTXID: 2n,
+				pages: [{ pgno: 1, data: new Uint8Array(512) }],
+				preApplyChecksum: 1n << 63n,
+			})
+		).toThrow(/not allowed/);
+	});
+});
+
+/**
+ * A snapshot must carry the whole database. These are regression tests for a
+ * real interop bug: sparse snapshots encoded cleanly here and then failed in
+ * `litestream restore` with "nonsequential page numbers in snapshot
+ * transaction".
+ */
+describe('encodeLtx snapshot completeness', () => {
+	const page = (pgno: number): LtxPage => ({
+		pgno,
+		data: new Uint8Array(512).fill(pgno),
+	});
+
+	it('rejects a snapshot with a gap', () => {
+		expect(() =>
+			encodeLtx({
+				pageSize: 512,
+				commit: 4,
+				minTXID: 1n,
+				maxTXID: 1n,
+				pages: [page(1), page(2), page(4)],
+			})
+		).toThrow(/must carry every page: expected page 3/);
+	});
+
+	it('rejects a snapshot that does not start at page 1', () => {
+		expect(() =>
+			encodeLtx({
+				pageSize: 512,
+				commit: 2,
+				minTXID: 1n,
+				maxTXID: 1n,
+				pages: [page(2)],
+			})
+		).toThrow(/expected page 1/);
+	});
+
+	it('rejects a snapshot that stops short of the commit size', () => {
+		expect(() =>
+			encodeLtx({
+				pageSize: 512,
+				commit: 4,
+				minTXID: 1n,
+				maxTXID: 1n,
+				pages: [page(1), page(2)],
+			})
+		).toThrow(/expected page 4 last/);
+	});
+
+	it('rejects a snapshot carrying no pages at all', () => {
+		expect(() =>
+			encodeLtx({
+				pageSize: 512,
+				commit: 1,
+				minTXID: 1n,
+				maxTXID: 1n,
+				pages: [],
+			})
+		).toThrow(/expected page 1 last/);
+	});
+
+	it('allows an incremental to be as sparse as it likes', () => {
+		const encoded = encodeLtx({
+			pageSize: 512,
+			commit: 9,
+			minTXID: 2n,
+			maxTXID: 2n,
+			pages: [page(2), page(7)],
+		});
+		expect(decodeLtx(encoded).pages.map((p) => p.pgno)).toEqual([2, 7]);
+	});
+
+	it('rejects a page past the commit size', () => {
+		expect(() =>
+			encodeLtx({
+				pageSize: 512,
+				commit: 2,
+				minTXID: 2n,
+				maxTXID: 2n,
+				pages: [page(1), page(5)],
+			})
+		).toThrow(/past the commit size/);
 	});
 });

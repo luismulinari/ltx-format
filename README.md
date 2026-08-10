@@ -15,8 +15,10 @@ linking SQLite.
 
 This package is **pure**. It performs no I/O and has no knowledge of SQLite,
 object storage, or any particular runtime — you hand it pages and get bytes
-back. It has **zero runtime dependencies** and works in Node.js, Deno, Bun,
-browsers, and WebAssembly hosts.
+back. It has **zero runtime dependencies** and touches nothing beyond
+`Uint8Array`, `DataView`, and `ArrayBuffer`, so it runs in any modern
+JavaScript runtime. CI exercises Node.js 22 and 24; Deno, Bun, and browsers
+are expected to work but are not covered by tests.
 
 ## Install
 
@@ -24,16 +26,21 @@ browsers, and WebAssembly hosts.
 npm install ltx-format
 ```
 
-The package is ESM-only and requires Node.js 22 or newer.
+The package is ESM-only. It requires Node.js 22.12 or newer — that is the
+release where `require()` of an ES module became available unflagged, so CommonJS
+callers can `require('ltx-format')` too.
 
 ## Usage
 
 ### Writing a snapshot
 
 A snapshot (`minTXID === 1n`) carries every page of the database, so it can be
-restored standalone.
+restored standalone. The encoder enforces that: pages must run `1..commit` with
+no gaps, skipping only the lock page. A sparse snapshot is rejected here rather
+than failing later inside `litestream restore`.
 
 ```ts
+import { writeFile } from 'node:fs/promises';
 import { encodeLtx, formatFilename } from 'ltx-format';
 
 const pageSize = 4096;
@@ -70,6 +77,7 @@ const file = encodeLtx({
 ### Reading
 
 ```ts
+import { readFile, writeFile } from 'node:fs/promises';
 import { applyLtxToImage, decodeLtx, decodeToSnapshotImage } from 'ltx-format';
 
 const snapshot = decodeLtx(await readFile('0000000000000001-0000000000000001.ltx'));
@@ -114,21 +122,33 @@ const file = encodeLtx({
 
 For a snapshot the post-apply checksum is computed for you, since a snapshot
 contains every page. For an incremental it depends on pages the file does not
-carry, so you have to supply it — typically by folding each changed page into
-the value you carried forward:
+carry, so you have to supply it — by folding each change into the value you
+carried forward from the previous transaction:
 
 ```ts
 import { CHECKSUM_FLAG, foldPageChecksum } from 'ltx-format';
 
-let rolling = CHECKSUM_FLAG; // the empty-database value
+// CHECKSUM_FLAG is the value for an empty database, so it is only the right
+// starting point for the very first transaction.
+let rolling = previous?.trailer.postApplyChecksum ?? CHECKSUM_FLAG;
+
 for (const page of dirtyPages) {
-	rolling = foldPageChecksum(rolling, page.pgno, oldPageData); // remove
-	rolling = foldPageChecksum(rolling, page.pgno, page.data); // re-add
+	const before = imageBeforeTransaction.subarray(
+		(page.pgno - 1) * pageSize,
+		page.pgno * pageSize
+	);
+	// Pages appended by this transaction have nothing to remove.
+	if (before.length === pageSize) {
+		rolling = foldPageChecksum(rolling, page.pgno, before);
+	}
+	rolling = foldPageChecksum(rolling, page.pgno, page.data);
 }
 ```
 
 `foldPageChecksum` is an XOR fold, so it is its own inverse and independent of
-page order.
+page order — folding a page in twice removes it again, which is what makes the
+"remove the old, add the new" pattern above work. If the transaction shrinks
+the database, fold out every page past the new `commit` as well.
 
 ## API
 
@@ -182,6 +202,15 @@ Two deliberate choices are worth knowing about:
   *reader* handles compressed blocks, because Litestream writes them.
 - **Timestamps default to `0`**, so encoding is deterministic: the same pages
   produce the same bytes. Pass `timestamp` if you want a real one.
+
+One capability of the format is not implemented: the encoder cannot write
+*deletion* files (`commit === 0`), which the reference implementation uses to
+record that a database was dropped. The decoder reads them fine.
+
+`encodeLtx` and `writeHeader` enforce every invariant `Header.Validate()` and
+`Encoder.EncodePage()` enforce in ltx v0.5.1, so a file this library accepts is
+one the reference implementation accepts. That parity is the point: a
+validation gap here shows up as an unreadable replica later.
 
 ## Development
 

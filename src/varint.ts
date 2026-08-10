@@ -23,6 +23,12 @@ export function writeUvarint(out: number[], value: number): number {
 	return written + 1;
 }
 
+/**
+ * Longest legal encoding of a 64-bit value, matching Go's `MaxVarintLen64`.
+ * Anything longer is malformed rather than merely large.
+ */
+const MAX_LENGTH = 10;
+
 /** Reads a uvarint at `offset`, returning the value and the new offset. */
 export function readUvarint(
 	data: Uint8Array,
@@ -35,13 +41,19 @@ export function readUvarint(
 		if (cursor >= data.length) {
 			throw new Error('Truncated uvarint');
 		}
+		if (cursor - offset >= MAX_LENGTH) {
+			throw new Error('Uvarint is longer than 10 bytes');
+		}
 		const byte = data[cursor++];
 		value += (byte & 0x7f) * shift;
-		if ((byte & 0x80) === 0) break;
-		shift *= 128;
+		// Checked on every byte including the last: a run of zero-payload
+		// continuation bytes keeps `value` at 0 while `shift` grows, so a check
+		// placed after the loop's exit would never see the overflow it causes.
 		if (!Number.isSafeInteger(value)) {
 			throw new Error('Uvarint exceeds the safe integer range');
 		}
+		if ((byte & 0x80) === 0) break;
+		shift *= 128;
 	}
 	return { value, offset: cursor };
 }

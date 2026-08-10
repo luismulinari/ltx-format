@@ -22,7 +22,6 @@
 		"skipLibCheck": true,
 
 		"declaration": true,
-		"declarationMap": true,
 		"sourceMap": true,
 		"noEmit": true
 	},

@@ -61,6 +61,20 @@ describe('malformed LTX input', () => {
 		expect(() => decodeLtx(bytes)).toThrow(/page index/);
 	});
 
+	it('rejects a page index whose offset disagrees with the block', () => {
+		const { bytes, indexSizeField } = sample();
+		const indexLength = Number(
+			new DataView(bytes.buffer).getBigUint64(indexSizeField, false)
+		);
+		// The index entry is (pgno, offset, size) as uvarints. For this file
+		// the offset is 100, which fits in one byte, so it can be rewritten
+		// without changing the index length.
+		const offsetByte = indexSizeField - indexLength + 1;
+		expect(bytes[offsetByte]).toBe(HEADER_SIZE);
+		bytes[offsetByte] = HEADER_SIZE - 1;
+		expect(() => decodeLtx(bytes)).toThrow(/does not match block offset/);
+	});
+
 	it('rejects a page that decompresses to the wrong size', () => {
 		const { bytes } = sample();
 		// Claim a larger page size than the frames actually hold.
@@ -161,6 +175,111 @@ describe('malformed LZ4 frames', () => {
 			})
 		);
 		expect([...decoded.data]).toEqual([7, 8, 9]);
+	});
+
+	/** Encodes a length as a token nibble plus LZ4's 255-run extension bytes. */
+	function lengthExtension(length: number): number[] {
+		const bytes: number[] = [];
+		let remaining = length - 15;
+		while (remaining >= 255) {
+			bytes.push(255);
+			remaining -= 255;
+		}
+		bytes.push(remaining);
+		return bytes;
+	}
+
+	it('rejects a block claiming more literals than it holds', () => {
+		// Claim 70 KiB of literals but supply 100 bytes. Writing past a
+		// Uint8Array is silently dropped, so without an explicit bounds check
+		// this decoded to exactly 65536 bytes of garbage — and at a 64 KiB
+		// page size that is a legal page length, so nothing downstream would
+		// have caught it either.
+		const body = [0xf0, ...lengthExtension(70000)];
+		for (let i = 0; i < 100; i++) body.push(0x41);
+
+		expect(() =>
+			decodeLz4Frame(
+				frame({
+					flg: 0x60,
+					bd: 0x40,
+					blocks: [{ header: body.length, body }],
+				})
+			)
+		).toThrow(/literals run past its end/);
+	});
+
+	it('rejects a match that would overrun the output buffer', () => {
+		// One literal, then a run-length match far longer than the 64 KiB the
+		// frame's block maximum allows the output to be.
+		const body = [0x1f, 0x41, 0x01, 0x00, ...lengthExtension(70000)];
+
+		expect(() =>
+			decodeLz4Frame(
+				frame({
+					flg: 0x60,
+					bd: 0x40,
+					blocks: [{ header: body.length, body }],
+				})
+			)
+		).toThrow(/past its maximum size/);
+	});
+
+	it('rejects literals that overrun the output buffer after a long match', () => {
+		// Inflate the output to just under 64 KiB with a run-length match, then
+		// append literals that are present in the block but do not fit. This is
+		// the only path that reaches the literal *output* bounds check, since a
+		// block can never hold more literals than the output can take on its own.
+		const body = [0x1f, 0x41, 0x01, 0x00, ...lengthExtension(65500)];
+		body.push(0xf0, ...lengthExtension(100));
+		for (let i = 0; i < 100; i++) body.push(0x42);
+
+		expect(() =>
+			decodeLz4Frame(
+				frame({
+					flg: 0x60,
+					bd: 0x40,
+					blocks: [{ header: body.length, body }],
+				})
+			)
+		).toThrow(/past its maximum size/);
+	});
+
+	it('rejects a block larger than the frame allows', () => {
+		expect(() =>
+			decodeLz4Frame(
+				frame({
+					flg: 0x60,
+					bd: 0x40,
+					blocks: [{ header: (STORED | 100000) >>> 0, body: [1, 2] }],
+				})
+			)
+		).toThrow(/exceeds the frame/);
+	});
+
+	it('rejects a frame that ends mid-block', () => {
+		expect(() =>
+			decodeLz4Frame(
+				frame({
+					flg: 0x60,
+					bd: 0x40,
+					blocks: [{ header: (STORED | 999) >>> 0, body: [1, 2, 3] }],
+				})
+			)
+		).toThrow(/Truncated LZ4 frame/);
+	});
+
+	it('rejects a match reaching back before the block', () => {
+		// One literal, then a match 300 bytes back with only 1 byte emitted.
+		expect(() =>
+			decodeLz4Frame(
+				frame({
+					flg: 0x60,
+					bd: 0x40,
+					blocks: [{ header: 4, body: [0x10, 0x41, 0x2c, 0x01] }],
+				})
+			)
+		).toThrow(/before the block/);
 	});
 
 	it('rejects a back-reference with a zero offset', () => {

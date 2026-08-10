@@ -58,9 +58,36 @@ reference implementation produces.
 ### Snapshots
 
 A file with `minTXID == 1` is a *snapshot*: it carries every page of the
-database and can be restored on its own. Its `preApplyChecksum` must be zero.
-Anything else is an *incremental* and carries only the pages its transaction
-range dirtied.
+database and can be restored on its own. Its `preApplyChecksum` must be zero,
+and its pages must run `1..commit` with no gaps other than the lock page — a
+sparse snapshot is rejected by the reference decoder with "nonsequential page
+numbers in snapshot transaction".
+
+Anything else is an *incremental*, which carries only the pages its transaction
+range dirtied and may be as sparse as it likes, as long as the page numbers
+ascend and none exceeds `commit`.
+
+A file with `commit == 0` is a *deletion*: it records that the database is
+gone, carries no pages, and must have a `postApplyChecksum` of exactly
+`ChecksumFlag`.
+
+### Pre-apply checksum rules
+
+These three cases are exhaustive, and getting them wrong produces files the
+reference implementation rejects:
+
+| File                              | `preApplyChecksum`                     |
+| --------------------------------- | -------------------------------------- |
+| Snapshot                          | must be zero                           |
+| Incremental, `NoChecksum` set      | must be zero — a value is *not allowed* |
+| Incremental, checksums tracked     | must be non-zero, with bit 63 set      |
+
+### WAL provenance
+
+`walOffset` and `walSize` are signed and must not be negative. A non-zero
+`walSalt1`/`walSalt2` requires a non-zero `walOffset`, and a non-zero `walSize`
+requires one too. All four are zero when the transaction came from a rollback
+journal rather than a WAL.
 
 ## Page block
 
