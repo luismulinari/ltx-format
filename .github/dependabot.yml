@@ -5,8 +5,22 @@ updates:
     schedule:
       interval: monthly
     groups:
+      # Majors are excluded so each one arrives as its own PR and can be
+      # evaluated on its own, rather than riding along with routine bumps.
       dev-dependencies:
         dependency-type: development
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # @types/node majors track Node majors, and these types are the only
+      # thing enforcing the "node": ">=22.12" engine floor in package.json.
+      # On a newer major, tsc accepts APIs that do not exist in Node 22 and
+      # the breakage only shows up at runtime, for users. Keep this pinned to
+      # the oldest supported Node and raise it by hand when that floor moves.
+      - dependency-name: "@types/node"
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: /
